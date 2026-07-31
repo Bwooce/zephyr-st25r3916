@@ -116,6 +116,9 @@ static struct gpio_callback irq_cb_data;
 
 static bool initialised;
 
+/* Post-bottom-half notification — see st25r3916_zephyr_set_irq_notify(). */
+static void (*irq_notify)(void);
+
 /* ---------------------------------------------------------------- IRQ -- */
 
 static void irq_work_handler(struct k_work *work)
@@ -129,6 +132,23 @@ static void irq_work_handler(struct k_work *work)
 		 */
 		irq_callback();
 	}
+
+	/* AFTER st25r3916Isr() has latched the interrupt status word. RFAL
+	 * only ever observes chip IRQs via that latched word (from a worker
+	 * pass), so a worker woken by the raw GPIO edge can run before the
+	 * bottom-half's SPI read completes, see nothing, and go back to
+	 * sleep — with the real event latched but unobserved. An app that
+	 * waits indefinitely between worker passes must therefore be kicked
+	 * HERE, not (only) at the GPIO edge.
+	 */
+	if (irq_notify != NULL) {
+		irq_notify();
+	}
+}
+
+void st25r3916_zephyr_set_irq_notify(void (*cb)(void))
+{
+	irq_notify = cb;
 }
 
 static void irq_isr(const struct device *port, struct gpio_callback *cb,
@@ -252,15 +272,141 @@ uint32_t st25r3916_zpf_uptime_ms(void)
 	return k_uptime_get_32();
 }
 
+/*
+ * Timer deadline tracking, feeding st25r3916_zephyr_next_timer_ms().
+ *
+ * RFAL timers are plain u32 deadlines (platformTimerDestroy is a no-op macro
+ * and platformTimerIsExpired computes from the handle alone), so RFAL never
+ * tells the platform which timers are still live. To let an application
+ * sleep until "the next RFAL timer" we shadow every created deadline in a
+ * small table and drop entries once they have expired AND been reported.
+ *
+ * Safety argument (why a deadline-driven wait cannot stall RFAL):
+ *  - every platformTimerCreate() is tracked (or degrades to polling on
+ *    overflow, below), so no live timer's expiry can pass silently;
+ *  - platformTimerIsExpired() is untouched by this table — RFAL's own
+ *    expiry checks work whether or not we still track the handle;
+ *  - an entry that expires unobserved (e.g. the discovery totalDuration
+ *    timer still pending when RFAL parks in Wake-Up mode) is reported
+ *    exactly once as "expired" (return 0 => run the worker now) and then
+ *    evicted, so a destroyed/abandoned timer costs one spurious worker
+ *    pass, never a busy loop and never a missed deadline.
+ *
+ * Slot count: RFAL v3.0.1 can hold at most ~9 concurrent timers with our
+ * feature set (GT/txRx/RXE/PPON2 in the RF layer, the NFC-layer discovery
+ * timer, NFC-A FDT retrans, NFC-B activation, ISO-DEP WTX, plus
+ * st25r3916WaitForInterruptsTimed's transient). 16 gives headroom; if it
+ * ever overflows anyway we degrade to 25 ms polling until the untracked
+ * deadline has certainly passed — the pre-deadline-wait behaviour, provably
+ * safe, and logged loudly since it means this comment's count went stale.
+ */
+#define ZPF_TIMER_SLOTS 16
+#define ZPF_TIMER_OVERFLOW_POLL_MS 25
+
+static uint32_t timer_deadline[ZPF_TIMER_SLOTS];
+static bool timer_used[ZPF_TIMER_SLOTS];
+static bool timer_overflowed;
+static uint32_t timer_overflow_until;
+static struct k_spinlock timer_lock; /* create: worker + IRQ BH threads */
+
 uint32_t st25r3916_zpf_timer_create(uint16_t ms)
 {
-	return k_uptime_get_32() + ms;
+	uint32_t now = k_uptime_get_32();
+	uint32_t deadline = now + ms;
+	k_spinlock_key_t key = k_spin_lock(&timer_lock);
+	int slot = -1;
+
+	for (int i = 0; i < ZPF_TIMER_SLOTS; i++) {
+		if (!timer_used[i]) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0) {
+		/* Last resort: reuse an expired-but-unreported slot. That
+		 * entry's one guaranteed "run the worker now" report is
+		 * forfeited, but a full table means a worker pass is active
+		 * right now (creates only happen inside RFAL calls), so
+		 * nothing is asleep waiting on it.
+		 */
+		for (int i = 0; i < ZPF_TIMER_SLOTS; i++) {
+			if ((int32_t)(now - timer_deadline[i]) >= 0) {
+				slot = i;
+				break;
+			}
+		}
+	}
+
+	if (slot >= 0) {
+		timer_used[slot] = true;
+		timer_deadline[slot] = deadline;
+	} else {
+		/* Untracked timer: remember the furthest such deadline and
+		 * poll until it has passed (see header comment).
+		 */
+		if (!timer_overflowed ||
+		    (int32_t)(deadline - timer_overflow_until) > 0) {
+			timer_overflow_until = deadline;
+		}
+		timer_overflowed = true;
+	}
+	k_spin_unlock(&timer_lock, key);
+
+	if (slot < 0) {
+		LOG_WRN("timer table overflow — degraded to %d ms polling",
+			ZPF_TIMER_OVERFLOW_POLL_MS);
+	}
+	return deadline;
 }
 
 bool st25r3916_zpf_timer_is_expired(uint32_t timer)
 {
 	/* Wrap-safe: signed distance from the deadline. */
 	return (int32_t)(k_uptime_get_32() - timer) >= 0;
+}
+
+int32_t st25r3916_zephyr_next_timer_ms(void)
+{
+	uint32_t now = k_uptime_get_32();
+	int32_t soonest = -1;
+	bool fired = false;
+	k_spinlock_key_t key = k_spin_lock(&timer_lock);
+
+	for (int i = 0; i < ZPF_TIMER_SLOTS; i++) {
+		if (!timer_used[i]) {
+			continue;
+		}
+
+		int32_t rem = (int32_t)(timer_deadline[i] - now);
+
+		if (rem <= 0) {
+			/* Report-once, then evict: the caller runs one worker
+			 * pass immediately, which is when RFAL observes the
+			 * expiry if the current state cares about it (both
+			 * reachable idle states — WAKEUP_MODE and
+			 * LISTEN_TECHDETECT — check their timer/flag at the
+			 * top of every pass, so one pass always suffices).
+			 */
+			timer_used[i] = false;
+			fired = true;
+		} else if (soonest < 0 || rem < soonest) {
+			soonest = rem;
+		}
+	}
+
+	if (timer_overflowed) {
+		if ((int32_t)(timer_overflow_until - now) > 0) {
+			if (soonest < 0 || soonest > ZPF_TIMER_OVERFLOW_POLL_MS) {
+				soonest = ZPF_TIMER_OVERFLOW_POLL_MS;
+			}
+		} else {
+			timer_overflowed = false;
+			fired = true;
+		}
+	}
+	k_spin_unlock(&timer_lock, key);
+
+	return fired ? 0 : soonest;
 }
 
 void st25r3916_zpf_log(const char *fmt, ...)
