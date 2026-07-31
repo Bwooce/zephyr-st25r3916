@@ -84,9 +84,9 @@ project is not affiliated with or endorsed by STMicroelectronics.
 ### Build the identity sample (nRF54L15 DK)
 
 ```sh
-source ~/zephyrproject/.venv/bin/activate
+source <your-zephyr-workspace>/.venv/bin/activate
 cd samples/identity
-ZEPHYR_BASE=~/zephyrproject/zephyr west build -b nrf54l15dk/nrf54l15/cpuapp .
+ZEPHYR_BASE=<your-zephyr-workspace>/zephyr west build -b nrf54l15dk/nrf54l15/cpuapp .
 west flash            # or: probe-rs run / flash per your setup
 ```
 
