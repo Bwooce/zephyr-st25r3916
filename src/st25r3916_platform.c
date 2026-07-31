@@ -15,6 +15,46 @@
  *    why it cannot run in real ISR context.
  *  - A recursive comm mutex serialises SPI access between those two threads;
  *    a second mutex protects the shared IRQ-status word.
+ *
+ * Shared-bus arbitration (the reader may share its SPI controller with other
+ * devices — e.g. an onboard NOR flash):
+ *
+ *  RFAL groups logically-related transfers between platformSpiSelect() and
+ *  platformSpiDeselect() and expects CS to stay asserted across the whole
+ *  group. Driving CS as a bare GPIO (the obvious port) satisfies RFAL but
+ *  BYPASSES Zephyr's per-controller bus lock: another device's driver (e.g.
+ *  spi_nor) could win the controller mid-group and clock the bus while the
+ *  reader's CS is still low — corrupting both devices' transfers.
+ *
+ *  Instead, the Select..Deselect window is mapped onto the SPI API's own
+ *  arbitration primitives, SPI_LOCK_ON | SPI_HOLD_ON_CS:
+ *
+ *   - platformSpiSelect() touches no hardware; it only opens the group.
+ *   - The first platformSpiTxRx() of the group runs spi_transceive() with a
+ *     config that carries the devicetree cs-gpios entry plus LOCK_ON and
+ *     HOLD_ON_CS: the driver acquires the controller-wide spi_context lock
+ *     (the same lock every other device on the bus contends on), asserts CS
+ *     itself, transfers, and — because of those two flags — keeps BOTH the
+ *     lock and CS across any further transfers in the group.
+ *   - platformSpiDeselect() calls spi_release(), which forces CS inactive
+ *     and releases the controller lock.
+ *
+ *  Consequences, all deliberate:
+ *   - CS asserts at the group's first transfer, not at Select. No clocking
+ *     happens in between, so the chip cannot observe the difference.
+ *   - Another device's transfer can no longer interleave inside a group; it
+ *     blocks (K_FOREVER, inside the SPI driver) until Deselect. Worst-case
+ *     tap-path latency is therefore bounded by the longest transfer any
+ *     bus-mate performs — budget accordingly (e.g. chunk NOR-flash erases).
+ *   - On a transfer error the nrfx driver force-clears CS even under
+ *     HOLD_ON_CS; Deselect's spi_release() then reconciles the lock state
+ *     (checked against the driver source, not assumed).
+ *   - Correctness requires every Select..Deselect window to sit inside
+ *     platformProtectST25RComm(), which the ST comm layer guarantees
+ *     (st25r3916comStart/Stop). The comm mutex is what stops the discovery
+ *     thread and the IRQ bottom-half from interleaving their OWN groups; the
+ *     bus lock is deliberately not recursive-per-thread and both threads use
+ *     the same spi_config, so unprotected concurrent groups would corrupt.
  */
 
 #define DT_DRV_COMPAT st_st25r3916
@@ -40,25 +80,29 @@ LOG_MODULE_REGISTER(st25r3916, CONFIG_ST25R3916_LOG_LEVEL);
 /*
  * ST25R3916 SPI format: mode 1 (CPOL=0, CPHA=1), MSB first, 8-bit words,
  * up to 10 MHz. The frequency comes from the node's spi-max-frequency.
- * Chip select is driven manually (see rfal_platform.h), so the spi_config
- * carries no cs — Zephyr must not toggle it per transfer.
+ *
+ * SPI_LOCK_ON + SPI_HOLD_ON_CS implement RFAL's "keep CS low across a group
+ * of transfers" contract THROUGH the Zephyr SPI API rather than around it —
+ * see the shared-bus arbitration note in the header comment. The devicetree
+ * cs-gpios entry stays in the config so the controller owns the CS pin.
  */
 #define ST25R3916_SPI_OP (SPI_OP_MODE_MASTER | SPI_WORD_SET(8) | \
-			  SPI_TRANSFER_MSB | SPI_MODE_CPHA)
+			  SPI_TRANSFER_MSB | SPI_MODE_CPHA | \
+			  SPI_LOCK_ON | SPI_HOLD_ON_CS)
 
 static const struct spi_dt_spec bus =
 	SPI_DT_SPEC_INST_GET(0, ST25R3916_SPI_OP);
-static const struct gpio_dt_spec cs_gpio =
-	SPI_CS_GPIOS_DT_SPEC_INST_GET(0);
 static const struct gpio_dt_spec irq_gpio =
 	GPIO_DT_SPEC_INST_GET(0, irq_gpios);
 static const struct gpio_dt_spec en_gpio =
 	GPIO_DT_SPEC_INST_GET_OR(0, en_gpios, {0});
 
-/* spi_dt_spec's config includes the devicetree cs-gpios; strip it so the
- * controller never touches CS. Filled in at init from bus.config.
+/*
+ * True from the first transfer of a Select..Deselect group until Deselect
+ * releases the bus. Only ever touched with the comm mutex held (all RFAL
+ * Select/TxRx/Deselect sequences run inside platformProtectST25RComm()).
  */
-static struct spi_config spi_cfg;
+static bool bus_held;
 
 static struct k_mutex comm_mutex;
 static struct k_mutex irq_status_mutex;
@@ -111,12 +155,39 @@ void st25r3916_zpf_irq_set_callback(void (*cb)(void))
 
 void st25r3916_zpf_spi_select(void)
 {
-	gpio_pin_set_dt(&cs_gpio, 1);
+	/*
+	 * Deliberately no hardware action. CS is asserted by the SPI driver
+	 * at the group's first transfer, AFTER it has won the controller
+	 * lock — asserting it here, before the lock, would re-open the exact
+	 * shared-bus corruption window this design exists to close. No
+	 * clocking happens between Select and the first transfer, so the
+	 * chip cannot observe the deferred assertion.
+	 */
 }
 
 void st25r3916_zpf_spi_deselect(void)
 {
-	gpio_pin_set_dt(&cs_gpio, 0);
+	int rc;
+
+	if (!bus_held) {
+		/* A group with no transfers (e.g. st25r3916Initialize()'s
+		 * defensive bare Deselect): nothing was locked, CS is
+		 * already parked inactive by the controller.
+		 */
+		return;
+	}
+
+	/* Forces CS inactive and releases the controller lock (verified in
+	 * spi_context_unlock_unconditionally()). -EPERM means the driver
+	 * already reconciled ownership after a failed transfer — CS is
+	 * inactive in that path too (the nrfx driver force-clears CS on
+	 * error even under SPI_HOLD_ON_CS).
+	 */
+	rc = spi_release(bus.bus, &bus.config);
+	if (rc != 0 && rc != -EPERM) {
+		LOG_ERR("SPI bus release failed (%d)", rc);
+	}
+	bus_held = false;
 }
 
 void st25r3916_zpf_spi_txrx(const uint8_t *tx, uint8_t *rx, uint16_t len)
@@ -131,9 +202,17 @@ void st25r3916_zpf_spi_txrx(const uint8_t *tx, uint8_t *rx, uint16_t len)
 	 * writes; spi_transceive handles NULL buf entries by clocking zeroes
 	 * out / discarding input, which matches the ST expectation.
 	 */
-	rc = spi_transceive(bus.bus, &spi_cfg,
+	rc = spi_transceive(bus.bus, &bus.config,
 			    (tx != NULL) ? &tx_set : NULL,
 			    (rx != NULL) ? &rx_set : NULL);
+
+	/* Success or failure, the group now owns (or owes) the controller
+	 * lock until Deselect reconciles it via spi_release(). On success
+	 * SPI_LOCK_ON kept the lock and SPI_HOLD_ON_CS kept CS asserted for
+	 * the rest of the group.
+	 */
+	bus_held = true;
+
 	if (rc != 0) {
 		LOG_ERR("SPI transceive failed (%d)", rc);
 	}
@@ -225,29 +304,27 @@ int st25r3916_zephyr_init(void)
 		return 0;
 	}
 
+	/* spi_is_ready_dt also checks the cs-gpios controller — CS stays in
+	 * the config so the SPI driver owns the pin (parked OUTPUT_INACTIVE
+	 * by the controller's own init, asserted/held/released per group;
+	 * see the shared-bus arbitration note in the header comment).
+	 */
 	if (!spi_is_ready_dt(&bus)) {
 		LOG_ERR("SPI bus %s not ready", bus.bus->name);
 		return -ENODEV;
 	}
-	if (!gpio_is_ready_dt(&cs_gpio) || !gpio_is_ready_dt(&irq_gpio)) {
-		LOG_ERR("CS/IRQ GPIO controller not ready");
+	if (!bus.config.cs.cs_is_gpio) {
+		LOG_ERR("no cs-gpios entry for the st,st25r3916 node — the "
+			"grouped-transfer CS hold requires GPIO chip select");
+		return -ENODEV;
+	}
+	if (!gpio_is_ready_dt(&irq_gpio)) {
+		LOG_ERR("IRQ GPIO controller not ready");
 		return -ENODEV;
 	}
 
-	/* Manual chip select: copy the devicetree-derived config, then drop
-	 * its cs so the SPI driver never drives the pin itself.
-	 */
-	spi_cfg = bus.config;
-	spi_cfg.cs = (struct spi_cs_control){0};
-
 	k_mutex_init(&comm_mutex);
 	k_mutex_init(&irq_status_mutex);
-
-	rc = gpio_pin_configure_dt(&cs_gpio, GPIO_OUTPUT_INACTIVE);
-	if (rc != 0) {
-		LOG_ERR("CS configure failed (%d)", rc);
-		return rc;
-	}
 
 	if (en_gpio.port != NULL) {
 		rc = gpio_pin_configure_dt(&en_gpio, GPIO_OUTPUT_ACTIVE);
@@ -296,9 +373,10 @@ int st25r3916_zephyr_init(void)
 	}
 
 	initialised = true;
-	LOG_INF("platform bound: SPI %s @%u Hz, CS %s pin %u, IRQ %s pin %u",
-		bus.bus->name, spi_cfg.frequency,
-		cs_gpio.port->name, cs_gpio.pin,
+	LOG_INF("platform bound: SPI %s @%u Hz, CS %s pin %u (bus-locked "
+		"groups), IRQ %s pin %u",
+		bus.bus->name, bus.config.frequency,
+		bus.config.cs.gpio.port->name, bus.config.cs.gpio.pin,
 		irq_gpio.port->name, irq_gpio.pin);
 	return 0;
 }

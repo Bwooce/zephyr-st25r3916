@@ -24,7 +24,7 @@ but structured as an independent, reusable Zephyr module.
 | Piece | State |
 |---|---|
 | ST RFAL v3.0.1 core + ST25R3916/B chip layer, vendored verbatim | compiles clean (no warnings) under Zephyr 4.4.99 / SDK 1.0.1, `nrf54l15dk/nrf54l15/cpuapp` |
-| Zephyr platform shim (SPI, manual CS, IRQ bottom-half work queue, locking, timers, logging) | compiles; init path (SPI bind, CS/IRQ GPIO configure, work queue start) executed on a real nRF54L15 DK; **the SPI/IRQ data paths have never talked to a real chip** |
+| Zephyr platform shim (SPI with bus-locked grouped transfers — `SPI_LOCK_ON`/`SPI_HOLD_ON_CS`, controller-owned CS — IRQ bottom-half work queue, locking, timers, logging) | compiles; init path (SPI bind, IRQ GPIO configure, work queue start) executed on a real nRF54L15 DK; grouped-transfer bus arbitration exercised on real DK silicon by the OffGridGate on-device suite (concurrent NOR-flash traffic on a shared `spi00`); **the SPI/IRQ data paths have never talked to a real ST25R3916B chip** |
 | `samples/identity` (read + verify the IC identity register, then full RFAL init) | builds for the nRF54L15 DK in all three configurations (3916, 3916B, 3916B + ElecHouse analog table); flashed to a DK with **no reader attached**: boots, binds the platform, fails cleanly ("IC_IDENTITY read 0x00") and retries — no hard fault |
 | Devicetree binding `st,st25r3916` | in place |
 | Any RF operation (field on, polling, ISO14443, ISO-DEP) | **not attempted anywhere** |
@@ -156,10 +156,24 @@ own APIs (`rfal_nfc.h` etc.) are available.
 - **The IRQ is serviced in a dedicated work queue thread**, not ISR
   context: `st25r3916Isr()` reads interrupt registers over SPI. The GPIO
   ISR only submits work.
-- **Chip select is driven manually** (as a GPIO, not by the SPI
-  controller) because ST's comm layer holds CS across logically grouped
-  transfers. `ST25R_COM_SINGLETXRX` is enabled, so each CS window carries
-  exactly one full-duplex Zephyr `spi_transceive()`.
+- **Chip select is controller-owned, with grouped transfers arbitrated
+  through the SPI API itself.** ST's comm layer holds CS across logically
+  grouped transfers (Select..Deselect). An earlier revision drove CS as a
+  bare GPIO, which satisfies RFAL but bypasses Zephyr's per-controller bus
+  lock — on a shared bus (e.g. a board whose NOR flash sits on the same
+  controller) another driver could clock the bus inside a held-CS group and
+  corrupt both devices. The platform layer now keeps the devicetree
+  `cs-gpios` entry in its `spi_config` and sets `SPI_LOCK_ON |
+  SPI_HOLD_ON_CS`: the group's first `spi_transceive()` wins the
+  controller-wide lock and asserts CS, both are held across the group, and
+  `platformSpiDeselect()` releases them via `spi_release()`. CS asserts at
+  the first transfer rather than at Select — no clocking happens in between,
+  so the chip cannot observe the difference. Two consequences to design
+  around: a bus-mate's in-flight transfer now delays the start of a reader
+  group (keep bus-mates' transfers short — chunk NOR-flash erases), and every
+  Select..Deselect group must run inside `platformProtectST25RComm()` (ST's
+  comm layer already guarantees this). `ST25R_COM_SINGLETXRX` is enabled, so
+  each CS window carries exactly one full-duplex Zephyr `spi_transceive()`.
 - ST sources are compiled **verbatim** — no patches. All platform
   adaptation lives in `src/rfal_platform.h`.
 

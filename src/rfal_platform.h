@@ -162,9 +162,15 @@ bool     st25r3916_zpf_timer_is_expired(uint32_t timer);
 #define ST25R_INT_PIN                       0
 #define platformGpioIsHigh(port, pin)       st25r3916_zpf_irq_pin_is_high()
 
-/* SPI. Chip select is driven manually (not by the SPI controller) because
- * the ST comm layer brackets logically-grouped transfers between Select and
- * Deselect itself.
+/* SPI. The ST comm layer brackets logically-grouped transfers between Select
+ * and Deselect and expects CS held across the group. That is implemented via
+ * Zephyr's SPI_LOCK_ON + SPI_HOLD_ON_CS (controller-owned CS, controller-wide
+ * bus lock held for the whole group), NOT by driving CS as a bare GPIO — a
+ * bare GPIO would bypass the SPI bus lock and let another device on a shared
+ * bus (e.g. an onboard NOR flash) clock the bus inside a held-CS group. CS
+ * therefore asserts at the group's FIRST transfer rather than at Select; no
+ * clocking happens in between, so the chip cannot tell. See the shared-bus
+ * arbitration note in st25r3916_platform.c.
  */
 #define platformSpiSelect()                 st25r3916_zpf_spi_select()
 #define platformSpiDeselect()               st25r3916_zpf_spi_deselect()
