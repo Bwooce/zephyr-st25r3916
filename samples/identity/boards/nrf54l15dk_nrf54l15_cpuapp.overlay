@@ -1,0 +1,44 @@
+/*
+ * Copyright (c) 2026 Bruce Fitzsimons
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * nRF54L15 DK wiring for the identity sample — PROVISIONAL, chosen to be
+ * defensible on this DK, not a blessed pinout. It matches the OffGridGate
+ * project's DK reader mapping so a bench set up for one serves both.
+ *
+ *   DK pin     signal   ElecHouse ST25R3916B Mini pin
+ *   ---------  -------  -----------------------------------------
+ *   P2.01      SCK      SCLK/SCL   (spi00 default pinctrl)
+ *   P2.02      MOSI     MOSI       (spi00 default pinctrl)
+ *   P2.04      MISO     MISO/SDA   (spi00 default pinctrl)
+ *   P2.10      CS       CS         (active low)
+ *   P1.11      IRQ      IRQ        (active high)
+ *   5V         supply   5V   — the module wants a 5 V supply; its logic
+ *                              lines are 3.3 V-compatible
+ *   GND        ground   GND
+ *
+ * The module's connector order is: IRQ, CS, SCLK/SCL, MOSI, MISO/SDA, 5V, GND.
+ *
+ * HARD CONSTRAINT, proven on real silicon: the IRQ line must be on port P0
+ * or P1. The nRF54L15 has GPIOTE instances for P0 (gpiote30) and P1
+ * (gpiote20) only — port P2 pins cannot generate GPIO interrupts, and
+ * gpio_pin_interrupt_configure() on a P2 pin fails at run time with
+ * -ENOTSUP. SPI signals and the CS output on P2 are fine (no GPIOTE
+ * involved). P1.11 is genuinely unassigned on this DK (P1.08/09/13 are
+ * buttons, P1.10/14 are LEDs, P1.04-07 are the VCOM UART).
+ */
+
+&spi00 {
+	status = "okay";
+	cs-gpios = <&gpio2 10 GPIO_ACTIVE_LOW>;
+
+	st25r3916: st25r3916@0 {
+		compatible = "st,st25r3916";
+		reg = <0>;
+		/* Conservative for flying leads; the chip itself is good to
+		 * 10 MHz.
+		 */
+		spi-max-frequency = <4000000>;
+		irq-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
+	};
+};

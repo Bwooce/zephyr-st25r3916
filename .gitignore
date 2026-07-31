@@ -1,0 +1,15 @@
+# Zephyr build output
+build/
+build-*/
+twister-out*/
+
+# Editor/OS noise
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

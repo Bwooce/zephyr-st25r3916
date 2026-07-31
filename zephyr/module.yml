@@ -1,0 +1,6 @@
+name: st25r3916
+build:
+  cmake: .
+  kconfig: Kconfig
+  settings:
+    dts_root: .

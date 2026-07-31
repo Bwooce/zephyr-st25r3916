@@ -1,0 +1,48 @@
+# Copyright (c) 2026 Bruce Fitzsimons
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  STMicroelectronics ST25R3916 / ST25R3916B high performance NFC universal
+  device (NFC reader/writer, card emulation, P2P), SPI-connected.
+
+  SPI format is mode 1 (CPOL=0, CPHA=1), MSB first, up to 10 MHz. Chip
+  select must be declared as the parent SPI bus's cs-gpios entry for this
+  device (active low); the driver drives it manually rather than through
+  the SPI controller, because ST's comm layer brackets grouped transfers
+  around a held chip select.
+
+  The IRQ line is a push-pull, active-high output from the IC. On nRF54L15
+  it MUST be wired to a P0 or P1 pin: port P2 has no GPIOTE instance and
+  cannot generate GPIO interrupts (gpio_pin_interrupt_configure() returns
+  -ENOTSUP at run time).
+
+  Example:
+
+    &spi00 {
+        status = "okay";
+        cs-gpios = <&gpio2 10 GPIO_ACTIVE_LOW>;
+
+        st25r3916@0 {
+            compatible = "st,st25r3916";
+            reg = <0>;
+            spi-max-frequency = <4000000>;
+            irq-gpios = <&gpio1 11 GPIO_ACTIVE_HIGH>;
+        };
+    };
+
+compatible: "st,st25r3916"
+
+include: spi-device.yaml
+
+properties:
+  irq-gpios:
+    type: phandle-array
+    required: true
+    description: |
+      Interrupt request line from the IC (push-pull, active high).
+
+  en-gpios:
+    type: phandle-array
+    description: |
+      Optional enable/power gate for the reader's supply rail. Driven
+      active during platform init, ahead of first SPI contact.

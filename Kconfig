@@ -1,0 +1,74 @@
+# Copyright (c) 2026 Bruce Fitzsimons
+# SPDX-License-Identifier: Apache-2.0
+
+menuconfig ST25R3916
+	bool "ST25R3916/ST25R3916B NFC reader (ST RFAL port) [WIP]"
+	default y
+	depends on DT_HAS_ST_ST25R3916_ENABLED
+	depends on SPI
+	depends on GPIO
+	help
+	  Driver for the STMicroelectronics ST25R3916 / ST25R3916B high
+	  performance NFC universal device, built by porting ST's RFAL
+	  (RF Abstraction Layer) onto Zephyr SPI/GPIO/kernel APIs.
+
+	  Work in progress: compiles, not yet validated against hardware.
+
+	  The ST-derived sources (third_party/st/) are licensed under ST's
+	  SLA0052 terms, which require execution in combination with an
+	  ST-manufactured NFC IC — which the ST25R3916/B is. See the
+	  repository README for the licence layout.
+
+if ST25R3916
+
+choice ST25R3916_VARIANT
+	prompt "Chip variant"
+	default ST25R3916_VARIANT_B
+	help
+	  ST's sources are compiled for exactly one variant; register-level
+	  behaviour (AAT, oscillator bring-up, regulator handling) differs.
+	  Check the marking on the IC, not the module's silkscreen.
+
+config ST25R3916_VARIANT_BASE
+	bool "ST25R3916"
+
+config ST25R3916_VARIANT_B
+	bool "ST25R3916B"
+
+endchoice
+
+config ST25R3916_ANALOG_CONFIG_ELECHOUSE
+	bool "Use the ElecHouse ST25R3916B Mini module analog config table"
+	help
+	  Replace ST's generic analog-configuration table with the
+	  antenna-tuning table shipped in the ElecHouse Arduino library for
+	  their ST25R3916B Mini module (different antenna tuning registers,
+	  field thresholds, RFO resistance and load-modulation settings).
+	  Select this when the connected hardware is that exact module;
+	  analog config tables are board/antenna specific.
+
+config ST25R3916_IRQ_THREAD_STACK_SIZE
+	int "IRQ bottom-half work queue stack size"
+	default 1024
+	help
+	  The ST25R3916 interrupt is serviced from a dedicated work queue
+	  thread (the handler reads interrupt registers over SPI, which is
+	  impossible in ISR context).
+
+config ST25R3916_IRQ_THREAD_PRIORITY
+	int "IRQ bottom-half work queue thread priority"
+	default -1
+	help
+	  Cooperative by default so interrupt servicing is not starved by
+	  application threads; RFAL's timing expectations are millisecond
+	  scale but interrupt-status loss shows up as protocol timeouts.
+
+config ST25R3916_LOG_BUF_SIZE
+	int "Formatting buffer for RFAL's platformLog messages"
+	default 128
+
+module = ST25R3916
+module-str = st25r3916
+source "subsys/logging/Kconfig.template.log_config"
+
+endif # ST25R3916
