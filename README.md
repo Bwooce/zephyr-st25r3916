@@ -2,11 +2,13 @@
 
 > ## ⚠️ IN DEVELOPMENT — NOT YET WORKING
 >
-> **This module compiles. It has never driven real silicon.** No register
-> transaction, no interrupt, no RF field, no card read has ever been
-> observed from this code. The first hardware milestone (the `identity`
-> sample answering over SPI) has not been reached yet. Version:
-> **0.0.1-wip**. Do not build a product on this today.
+> **This module compiles and boots, but no ST25R3916/B chip has ever
+> answered it.** The `identity` sample has been flashed to an nRF54L15 DK
+> *with no reader wired*: it boots, binds SPI/CS/IRQ, and loops a clean
+> "no chip answering" error — that is the entire extent of hardware
+> validation. No register transaction with a real ST25R3916/B, no
+> interrupt from one, no RF field, no card read has ever been observed.
+> Version: **0.0.1-wip**. Do not build a product on this today.
 
 A [Zephyr RTOS](https://zephyrproject.org) module providing a driver for the
 STMicroelectronics **ST25R3916 / ST25R3916B** high-performance NFC universal
@@ -22,8 +24,8 @@ but structured as an independent, reusable Zephyr module.
 | Piece | State |
 |---|---|
 | ST RFAL v3.0.1 core + ST25R3916/B chip layer, vendored verbatim | compiles clean (no warnings) under Zephyr 4.4.99 / SDK 1.0.1, `nrf54l15dk/nrf54l15/cpuapp` |
-| Zephyr platform shim (SPI, manual CS, IRQ bottom-half work queue, locking, timers, logging) | compiles; **logic reviewed but never executed against hardware** |
-| `samples/identity` (read + verify the IC identity register, then full RFAL init) | builds for the nRF54L15 DK in all three configurations (3916, 3916B, 3916B + ElecHouse analog table) |
+| Zephyr platform shim (SPI, manual CS, IRQ bottom-half work queue, locking, timers, logging) | compiles; init path (SPI bind, CS/IRQ GPIO configure, work queue start) executed on a real nRF54L15 DK; **the SPI/IRQ data paths have never talked to a real chip** |
+| `samples/identity` (read + verify the IC identity register, then full RFAL init) | builds for the nRF54L15 DK in all three configurations (3916, 3916B, 3916B + ElecHouse analog table); flashed to a DK with **no reader attached**: boots, binds the platform, fails cleanly ("IC_IDENTITY read 0x00") and retries — no hard fault |
 | Devicetree binding `st,st25r3916` | in place |
 | Any RF operation (field on, polling, ISO14443, ISO-DEP) | **not attempted anywhere** |
 | Card emulation / listen mode, P2P, wake-up mode, DPO, low-power mode | compiled out or untested; see `src/rfal_platform.h` feature table |
