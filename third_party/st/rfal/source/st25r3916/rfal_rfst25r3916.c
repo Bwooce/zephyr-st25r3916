@@ -4845,7 +4845,13 @@ static void rfalRunWakeUpModeWorker( void )
             if((irqs & ST25R3916_IRQ_MASK_WAM) != 0U)
             {
                 st25r3916ReadRegister( ST25R3916_REG_AMPLITUDE_MEASURE_RESULT, &aux );   /* Debug purposes */
-                
+
+                /* TEMP DIAGNOSTIC (5 Aug 2026, AAT-off/hardware-wake experiment) —
+                 * this is the genuine chip-level WAM threshold-cross IRQ; unlike the
+                 * SW Tag Detect path this fires only on a real hardware wake, so
+                 * seeing this line at all is itself the key signal. */
+                platformLog("WAM irq fired! raw=%u\r\n", (unsigned int)aux);
+
                 gRFAL.wum.info.indAmp.irqWu = true;
                 gRFAL.wum.state             = RFAL_WUM_STATE_ENABLED_WOKE;
             }
@@ -4895,8 +4901,8 @@ static void rfalRunWakeUpModeWorker( void )
                     if( gRFAL.wum.cfg.indAmp.enabled )
                     {
                         /* Perform amplitude measurement */
-                        st25r3916MeasureAmplitude( &reg );
-                        
+                        ReturnCode measRc = st25r3916MeasureAmplitude( &reg );
+
                         /* Update last measurement info */
                         gRFAL.wum.info.indAmp.lastMeas = reg;
                         
@@ -4925,6 +4931,29 @@ static void rfalRunWakeUpModeWorker( void )
                         if( (gRFAL.wum.cfg.indAmp.autoAvg) && ((gRFAL.wum.cfg.indAmp.aaInclMeas) || (!woke)) )
                         {
                             gRFAL.wum.cfg.indAmp.reference = rfalWakeUpModeFilter( gRFAL.wum.cfg.indAmp.reference, value, (RFAL_WU_MIN_WEIGHT_VAL<<(uint8_t)gRFAL.wum.cfg.indAmp.aaWeight) );
+                        }
+
+                        /* TEMP DIAGNOSTIC (5 Aug 2026 bench session, OffGridGate) — raw
+                         * SW Tag Detect amplitude/reference/delta/woke, nothing else in
+                         * the app logs these live numbers. Remove once wake-up mode is
+                         * confirmed reliable at the bench. */
+                        {
+                            uint8_t dbg_opctrl = 0;
+                            uint16_t dbg_vdd_rf = st25r3916MeasureVoltage(
+                                ST25R3916_REG_REGULATOR_CONTROL_mpsv_vdd_rf);
+
+                            st25r3916ReadRegister(ST25R3916_REG_OP_CONTROL, &dbg_opctrl);
+
+                            platformLog("WUM raw=%u value=%u ref=%u delta=%u woke=%u measRc=%d "
+                                        "OP_CONTROL=0x%02x(en=%d tx_en=%d wu=%d) VDD_RF=%umV\r\n",
+                                        (unsigned int)reg, (unsigned int)value,
+                                        (unsigned int)gRFAL.wum.cfg.indAmp.reference,
+                                        (unsigned int)delta, (unsigned int)woke, (int)measRc,
+                                        (unsigned int)dbg_opctrl,
+                                        (int)((dbg_opctrl & ST25R3916_REG_OP_CONTROL_en) != 0U),
+                                        (int)((dbg_opctrl & ST25R3916_REG_OP_CONTROL_tx_en) != 0U),
+                                        (int)((dbg_opctrl & ST25R3916_REG_OP_CONTROL_wu) != 0U),
+                                        (unsigned int)dbg_vdd_rf);
                         }
                     }
                     

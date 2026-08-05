@@ -275,11 +275,23 @@ uint32_t st25r3916_zpf_uptime_ms(void)
 /*
  * Timer deadline tracking, feeding st25r3916_zephyr_next_timer_ms().
  *
- * RFAL timers are plain u32 deadlines (platformTimerDestroy is a no-op macro
- * and platformTimerIsExpired computes from the handle alone), so RFAL never
- * tells the platform which timers are still live. To let an application
- * sleep until "the next RFAL timer" we shadow every created deadline in a
- * small table and drop entries once they have expired AND been reported.
+ * RFAL timers are plain u32 deadlines (platformTimerIsExpired computes from
+ * the handle alone, no table lookup needed for correctness). To let an
+ * application sleep until "the next RFAL timer" we shadow every created
+ * deadline in a small table and drop entries once they have expired AND
+ * been reported — OR as soon as RFAL itself calls platformTimerDestroy(),
+ * which now (5 Aug 2026 — see st25r3916_zpf_timer_destroy(), FIXED same
+ * day: this was a no-op macro until now) actually frees the matching slot
+ * immediately, instead of leaving it dead until the lazy idle-path reclaim
+ * or the create()-side "reuse an expired-but-unreported slot" fallback
+ * caught up with it. That mattered in practice: RFAL calls
+ * platformTimerDestroy() constantly during an active ISO-DEP session
+ * (rfalIsoDepTimerStart/nfcipTimerStart both destroy-then-recreate on every
+ * restart) - a discovery/tap-flow session was creating timers far faster
+ * than the OLD reclaim path (only exercised from the idle wait, see
+ * reader.c's "idle" gate on next_timer_ms()) could free them, hence the
+ * "timer table overflow — degraded to 25 ms polling" WARN flooding the
+ * bench log during every continuous-polling tap. Note the caveat below.
  *
  * Safety argument (why a deadline-driven wait cannot stall RFAL):
  *  - every platformTimerCreate() is tracked (or degrades to polling on
@@ -291,6 +303,17 @@ uint32_t st25r3916_zpf_uptime_ms(void)
  *    exactly once as "expired" (return 0 => run the worker now) and then
  *    evicted, so a destroyed/abandoned timer costs one spurious worker
  *    pass, never a busy loop and never a missed deadline.
+ *
+ * st25r3916_zpf_timer_destroy()'s own caveat: the "timer" handle IS the
+ * deadline value (no separate slot ID exists in this design, predating
+ * this fix), so destroy matches by VALUE — the first slot whose stored
+ * deadline equals the given handle. Two live timers created in the same
+ * tick with the same requested duration would collide (destroy could free
+ * the wrong one of the pair). Pre-existing design property, not introduced
+ * by this fix; not believed to be a correctness risk given the safety
+ * argument above (a wrongly-freed slot just means that OTHER timer falls
+ * back to being reported once via natural expiry, same as any timer this
+ * table simply never tracked).
  *
  * Slot count: RFAL v3.0.1 can hold at most ~9 concurrent timers with our
  * feature set (GT/txRx/RXE/PPON2 in the RF layer, the NFC-layer discovery
@@ -363,6 +386,28 @@ bool st25r3916_zpf_timer_is_expired(uint32_t timer)
 {
 	/* Wrap-safe: signed distance from the deadline. */
 	return (int32_t)(k_uptime_get_32() - timer) >= 0;
+}
+
+/*
+ * FIXED, 5 Aug 2026 (was a no-op macro - see the timer-table's own header
+ * comment above for why that mattered in practice). Frees the slot whose
+ * tracked deadline matches this handle, immediately, instead of leaving it
+ * dead until the lazy idle-path/overflow-fallback reclaim caught up. Matches
+ * by VALUE (the handle IS the deadline, no separate slot ID exists) - see
+ * the header comment's own note on the resulting, accepted same-tick-
+ * collision edge case.
+ */
+void st25r3916_zpf_timer_destroy(uint32_t timer)
+{
+	k_spinlock_key_t key = k_spin_lock(&timer_lock);
+
+	for (int i = 0; i < ZPF_TIMER_SLOTS; i++) {
+		if (timer_used[i] && timer_deadline[i] == timer) {
+			timer_used[i] = false;
+			break;
+		}
+	}
+	k_spin_unlock(&timer_lock, key);
 }
 
 int32_t st25r3916_zephyr_next_timer_ms(void)

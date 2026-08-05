@@ -120,6 +120,7 @@ void     st25r3916_zpf_error_handle(const char *file, int line);
  */
 uint32_t st25r3916_zpf_timer_create(uint16_t ms);
 bool     st25r3916_zpf_timer_is_expired(uint32_t timer);
+void     st25r3916_zpf_timer_destroy(uint32_t timer);
 
 /*
  * ------------------------------------------------------------------------
@@ -179,7 +180,7 @@ bool     st25r3916_zpf_timer_is_expired(uint32_t timer);
 /* Millisecond software timers. */
 #define platformTimerCreate(t)              st25r3916_zpf_timer_create(t)
 #define platformTimerIsExpired(timer)       st25r3916_zpf_timer_is_expired(timer)
-#define platformTimerDestroy(timer)
+#define platformTimerDestroy(timer)         st25r3916_zpf_timer_destroy(timer)
 #define platformDelay(t)                    st25r3916_zpf_delay_ms(t)
 #define platformGetSysTick()                st25r3916_zpf_uptime_ms()
 

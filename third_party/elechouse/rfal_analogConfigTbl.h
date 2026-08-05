@@ -293,7 +293,21 @@ const uint8_t rfalAnalogConfigDefaultSettings[] = {
   MODE_ENTRY_16_REG((RFAL_ANALOG_CONFIG_TECH_CHIP | RFAL_ANALOG_CONFIG_CHIP_INIT)
                     , ST25R3916_REG_IO_CONF1, (ST25R3916_REG_IO_CONF1_out_cl_mask | ST25R3916_REG_IO_CONF1_lf_clk_off), 0x07                               /* Disable MCU_CLK */
                     , ST25R3916_REG_IO_CONF2, (ST25R3916_REG_IO_CONF2_miso_pd1 | ST25R3916_REG_IO_CONF2_miso_pd2), 0x18                                    /* SPI Pull downs */
-                    , ST25R3916_REG_IO_CONF2,  ST25R3916_REG_IO_CONF2_aat_en, ST25R3916_REG_IO_CONF2_aat_en                                                /* Enable AAT */
+                    /* AAT restored to enabled (5 Aug 2026) — the AAT-off experiment neither
+                     * fixed nor broke wake-up detection (SW Tag Detect and genuine hardware
+                     * wake both still saw amplitude pegged at 255 with AAT off). Fable-agent
+                     * research against the actual ST25R3916B datasheet (DS13541 Rev 11) found
+                     * the real root cause instead: Measure Amplitude self-drives the TX field
+                     * (§4.4.8 p65), and this ElecHouse module runs the chip at 5V (VDD_RF
+                     * ~4.5V measured, matches datasheet's 5V-mode regulator behavior, §4.4.10
+                     * p65) — driving RFI well past the documented 3 Vpp max (which should read
+                     * only 0xE6/230, not our observed 255/0xFF ≈ ≥3.3 Vpp). AAT itself is a
+                     * red herring on this specific module: the ElecHouse schematic has no
+                     * varactors, so AAT_A/B route nowhere — it's copy-inherited boilerplate,
+                     * confirmed harmless either way. The real fix is reducing TX_DRIVER.d_res
+                     * (RFO driver resistance) specifically during wake-up's own measurement —
+                     * see the CHIP_WAKEUP_ON entry below. */
+                    , ST25R3916_REG_IO_CONF2,  ST25R3916_REG_IO_CONF2_aat_en, ST25R3916_REG_IO_CONF2_aat_en                                                /* Enable AAT (restored) */
                     , ST25R3916_REG_TX_DRIVER, ST25R3916_REG_TX_DRIVER_d_res_mask, 0x00                                                                    /* Set RFO resistance Active Tx */
                     , ST25R3916_REG_RES_AM_MOD, 0xFF, 0x80                                                                                          /* Use minimum non-overlap */
                     , ST25R3916_REG_FIELD_THRESHOLD_ACTV,   ST25R3916_REG_FIELD_THRESHOLD_ACTV_trg_mask, ST25R3916_REG_FIELD_THRESHOLD_ACTV_trg_105mV      /* Lower activation threshold (higher than deactivation)*/
@@ -322,6 +336,56 @@ const uint8_t rfalAnalogConfigDefaultSettings[] = {
                      , ST25R3916_REG_UNDERSHOOT_CONF2, 0xFF, 0x00                                                                            /* Disable Undershoot Protection */
                     )
 
+  /****** Default Analog Configuration for Wake-up On ******/
+  /* MISSING from this board's own table originally (5 Aug 2026 bench finding,
+   * OffGridGate): rfalWakeUpModeStart() unconditionally calls
+   * rfalSetAnalogConfig(CHIP_WAKEUP_ON), but this ElecHouse-derived table had zero
+   * entries for it — rfalSetAnalogConfig hits RFAL_ANALOG_CONFIG_LUT_NOT_FOUND on
+   * the first search and silently returns RFAL_ERR_NONE without applying anything
+   * (rfal_analogConfig.c). The AWS-disable entry (byte-exact from ST's own
+   * reference table) alone did NOT fix detection — raw amplitude stayed pegged at
+   * 255 regardless.
+   *
+   * REAL FIX (5 Aug 2026, later same day, Fable-agent research against the actual
+   * ST25R3916B datasheet DS13541 Rev 11): Measure Amplitude self-drives the TX
+   * field for its measurement (§4.4.8 p65), and this ElecHouse module runs the
+   * chip at 5V (not 3.3V as this project's own docs assumed elsewhere — worth
+   * correcting), so the field this measurement briefly generates overdrives the
+   * amplitude detector's RFI input past its documented 3 Vpp maximum (which
+   * should read only 0xE6/230 — our observed 255/0xFF means ≥~3.3 Vpp). Both SW
+   * Tag Detect AND genuine hardware wake-up failed identically because neither
+   * touches TX drive strength — AWS just shapes the modulation envelope, it
+   * doesn't reduce overall field power.
+   *
+   * d_res (TX_DRIVER RFO driver resistance, 4-bit field, ST25R3916_REG_TX_DRIVER)
+   * is what the datasheet explicitly names for this (§4.2.4 p31: measurement
+   * power "can be reduced by changing the RFO driver resistance"). CHIP_INIT sets
+   * d_res=0x0 (lowest resistance = strongest drive) for normal active polling —
+   * correct there, wrong for wake-up's own measurement. Default 13 picked per the
+   * local datasheet's own Table 78 (DS13541 Rev 11, p111): d_res=13 -> 36.6x
+   * normalized driver resistance, matching an ST community 3916B thread's
+   * reported reliable-wake-up value exactly (confirmed against the table
+   * directly, not the forum post's own paraphrase, which read ambiguously as
+   * "36.6%" — d_res=14 would be 51.2x, a different, unverified step) — bench-
+   * verified 5 Aug 2026: the first real card tap under this exact value produced
+   * a genuine hardware WAM interrupt (raw=39) and a full ALLOW.
+   *
+   * Exposed as CONFIG_ST25R3916_WAKEUP_D_RES (Kconfig.reader — this ElecHouse
+   * bench module is NOT the final product antenna, and repeat-tap testing
+   * showed some real taps waking correctly but not completing full activation,
+   * suggesting the wake-detection range and full-activation range may need
+   * independent per-antenna tuning) — tune via prj.conf, not by editing this
+   * table, using reader.c's live WAM/WUM diagnostic logging as feedback. */
+  , MODE_ENTRY_2_REG((RFAL_ANALOG_CONFIG_TECH_CHIP | RFAL_ANALOG_CONFIG_CHIP_WAKEUP_ON)
+                     , ST25R3916_REG_AUX_MOD, ST25R3916_REG_AUX_MOD_rgs_am, 0x00                                                            /* Disable AWS during WU  */
+                     , ST25R3916_REG_TX_DRIVER, ST25R3916_REG_TX_DRIVER_d_res_mask, CONFIG_ST25R3916_WAKEUP_D_RES                          /* Reduce field power for WU measurement — tune via CONFIG_ST25R3916_WAKEUP_D_RES */
+                    )
+
+  /****** Default Analog Configuration for Wake-up Off ******/
+  , MODE_ENTRY_2_REG((RFAL_ANALOG_CONFIG_TECH_CHIP | RFAL_ANALOG_CONFIG_CHIP_WAKEUP_OFF)
+                     , ST25R3916_REG_AUX_MOD, ST25R3916_REG_AUX_MOD_rgs_am, ST25R3916_REG_AUX_MOD_rgs_am                                    /* Re-enable AWS after WU */
+                     , ST25R3916_REG_TX_DRIVER, ST25R3916_REG_TX_DRIVER_d_res_mask, 0x00                                                    /* Restore full drive for active polling */
+                    )
 
   /****** Default Analog Configuration for Poll NFC-A Rx Common ******/
   , MODE_ENTRY_1_REG((RFAL_ANALOG_CONFIG_POLL | RFAL_ANALOG_CONFIG_TECH_NFCA | RFAL_ANALOG_CONFIG_BITRATE_COMMON | RFAL_ANALOG_CONFIG_RX)

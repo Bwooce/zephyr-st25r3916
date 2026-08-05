@@ -47,6 +47,38 @@ config ST25R3916_ANALOG_CONFIG_ELECHOUSE
 	  Select this when the connected hardware is that exact module;
 	  analog config tables are board/antenna specific.
 
+config ST25R3916_WAKEUP_D_RES
+	int "Wake-up mode TX_DRIVER RFO driver resistance step (d_res, 0-15)"
+	default 13
+	range 0 15
+	depends on ST25R3916_ANALOG_CONFIG_ELECHOUSE
+	help
+	  4-bit TX_DRIVER.d_res step applied during Wake-Up mode's own
+	  amplitude measurement only (CHIP_WAKEUP_ON analog config entry;
+	  restored to 0 — full drive — for normal active polling via
+	  CHIP_WAKEUP_OFF, unaffected by this option). Per the datasheet's
+	  own RFO driver resistance table (DS13541 Rev 11, Table 78), higher
+	  steps mean higher resistance and therefore a weaker measurement
+	  field: 0=1.00x ... 13=36.6x ... 14=51.2x ... 15=High-Z.
+
+	  5 Aug 2026 bench finding: this board's ElecHouse module runs the
+	  ST25R3916B at 5V, which overdrives the amplitude detector's RFI
+	  input (fixed 0-2V absolute-mode ADC range) past its documented
+	  3 Vpp maximum during Measure Amplitude's own self-driven field,
+	  reading permanently pegged at 255/0xFF regardless of real antenna
+	  loading — Wake-Up mode cannot detect a card at all until this is
+	  reduced. 13 is a real, bench-verified value (not a guess) — the
+	  first value tried, on the first real card tap under this exact
+	  step, produced a genuine hardware WAM interrupt with a sane
+	  raw=39 reading and a full ALLOW. Exposed as a Kconfig (rather than
+	  only the analog config table this feeds into) so it can be
+	  iterated per-antenna from prj.conf without editing vendored C —
+	  this board is NOT the final product antenna, and a real config
+	  item for this was requested (Bruce, 5 Aug 2026) once repeat-tap
+	  testing showed some real taps failing to fully activate after a
+	  genuine wake, suggesting the wake-detection range and the
+	  full-activation range may need independent tuning per antenna.
+
 config ST25R3916_IRQ_THREAD_STACK_SIZE
 	int "IRQ bottom-half work queue stack size"
 	default 1024
